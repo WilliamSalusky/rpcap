@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
 #include <string.h>
 #include <event.h>
 #include <pcap.h>
@@ -22,33 +23,21 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <time.h>
+#include "config.h"
 #include "iov.h"
 #include "rpcap.h"
 
-typedef struct r_dev {
-    int sock;
-    char *serv;
-    char *iface;
-    uint16_t port;
-    iov_t data;
-    struct event event;
-} r_dev_t;
-
 void rpcap_read_len(int sock, short which, r_dev_t *dev);
 
-int snaplen;
-int flags;
-char *bpfstr;
-int tunfd;
 int persist;
+char *config;
+int run_daemon;
 
 void globals_init(void)
 {
-    snaplen = 1024;
-    flags   = 0;
-    bpfstr  = NULL;
-    tunfd   = 0;
-    persist = 1;
+    config  = NULL;
+    persist = 0;
+    run_daemon = 0;
 }
 
 void free_rdev(r_dev_t *dev)
@@ -66,10 +55,12 @@ int parse_args(int argc, char **argv)
     int argcret = 0;
 
     char help[] = 
-	"-b <bpf>:          Global BPF Filter\n"
-	"-s <snaplen>       Global Snaplen\n";
+	"-c <config>:       Configuration file\n"
+	"-p         :       Keep virtual interfaces persistant\n"
+	"-d         :       Run as a daemon\n"
+	"-h         :       This help.\n";
 
-    while((c=getopt(argc, argv, "hf:s:")) != -1)
+    while((c=getopt(argc, argv, "dhc:p")) != -1)
     {
 	switch(c)
 	{
@@ -77,13 +68,14 @@ int parse_args(int argc, char **argv)
 		printf("Usage: %s [opts]\n%s\n", 
 			argv[0], help);
 		exit(1);
-	    case 'f':
-		bpfstr = strdup(optarg);
-		argcret += 2;
+	    case 'p':
+		persist = 1;
 		break;
-	    case 's':
-		snaplen = atoi(optarg);
-		argcret += 2;
+	    case 'c':
+		config = optarg;
+		break;
+	    case 'd':
+		run_daemon = 1;
 		break;
 	}
     }
@@ -91,7 +83,7 @@ int parse_args(int argc, char **argv)
 }
 
 int
-tuntap_init(void)
+tuntap_init(char *iname)
 {
 
     struct ifreq    ifr;
@@ -106,19 +98,23 @@ tuntap_init(void)
 
     ifr.ifr_flags = IFF_TAP|IFF_NO_PI;
 
-    strncpy(ifr.ifr_name, "rpcap0", IFNAMSIZ);
+    strncpy(ifr.ifr_name, iname, IFNAMSIZ);
 
     if ((err = ioctl(fd, TUNSETIFF, (void *) &ifr)) < 0) {
 	close(fd);
 	return err;
     }
 
-
     sock = socket(PF_UNIX, SOCK_STREAM, 0);
     ioctl(sock, SIOCGIFFLAGS, &ifr);
     ifr.ifr_flags |= IFF_UP;
     ioctl(sock, SIOCSIFFLAGS, &ifr);
     close(sock);
+
+    if (persist)
+	ioctl(fd, TUNSETPERSIST, 1);
+    else
+	ioctl(fd, TUNSETPERSIST, 0);
 
     return fd;
 }
@@ -143,7 +139,7 @@ rpcap_read_payload(int sock, short which, r_dev_t *dev)
 	event_add(&dev->event, 0);
     }
 
-    if(write(tunfd, dev->data.buf, dev->data.offset) <= 0)
+    if(write(dev->tunfd, dev->data.buf, dev->data.offset) <= 0)
     {
 	LOG("Error in tuntap write: %s\n", 
 		strerror(errno));
@@ -204,8 +200,9 @@ rpcap_handshake(int sock, short which, r_dev_t *dev)
     {
 	int iface_len;
 	int bpfstr_len;
+	int flags = 0;
 
-	bpfstr_len = bpfstr?strlen(bpfstr):0;
+	bpfstr_len = dev->bpf?strlen(dev->bpf):0;
 	iface_len  = strlen(dev->iface);
 
 	initialize_iov(&dev->data,
@@ -218,12 +215,12 @@ rpcap_handshake(int sock, short which, r_dev_t *dev)
 
 	memcpy(&dev->data.buf[0], &iface_len, sizeof(uint8_t));
 	memcpy(&dev->data.buf[1], &bpfstr_len, sizeof(uint32_t));
-	memcpy(&dev->data.buf[5], &snaplen, sizeof(uint16_t));
+	memcpy(&dev->data.buf[5], &dev->snaplen, sizeof(uint16_t));
 	memcpy(&dev->data.buf[7], &flags, sizeof(uint8_t)); 
 	memcpy(&dev->data.buf[8], dev->iface, iface_len);
 
-	if (bpfstr)
-	    memcpy(&dev->data.buf[8+iface_len], bpfstr, bpfstr_len);
+	if (dev->bpf)
+	    memcpy(&dev->data.buf[8+iface_len], dev->bpf, bpfstr_len);
 	
 	/*
 	if(bpfstr)
@@ -256,110 +253,117 @@ rpcap_handshake(int sock, short which, r_dev_t *dev)
     event_add(&dev->event, 0);
 }
 
-void 
-rpcap_srv_init(char *data)
+void rpdev_connect(r_dev_t *dev)
 {
-    char *tok, *host, *portstr, *iface;
-    int   port;
     struct sockaddr_in inaddr;
     uint32_t addr;
 
-    r_dev_t *rdev;
+    addr = inet_addr(dev->serv);
 
-    tok = strtok(data, ":");
+    inaddr.sin_family      = AF_INET;
+    inaddr.sin_addr.s_addr = addr; 
+    inaddr.sin_port        = htons(dev->port);
 
-    if (!tok)
+    if ((dev->sock = socket(PF_INET, SOCK_STREAM, 0)) <= 0)
     {
-	LOG("fmt: <host>:<iface>:<port>\n");
+	LOG("sockerr: %s\n", strerror(errno));
 	exit(1);
     }
 
-    host = tok;
-
-    portstr = strtok(NULL, ":");
-
-    if(!portstr)
-    {
-	LOG("No port in str %s\n", data);
-	exit(1);
-    }
-
-    port = atoi(portstr);
-
-    iface = strtok(NULL, ":");
-
-    if(!iface)
-    {
-	LOG("No interface found in %s\n", data);
-	exit(1);
-    }
-
-    if(!(rdev = calloc(sizeof(r_dev_t), 1)))
-    {
-	LOG("%s\n", strerror(errno));
-	exit(1);
-    }
-    
-    rdev->serv = strdup(host);
-    rdev->iface = strdup(iface);
-    rdev->port = port;
-
-    addr = inet_addr(rdev->serv);
-    inaddr.sin_family = AF_INET;
-    inaddr.sin_addr.s_addr = addr;
-    inaddr.sin_port = htons(rdev->port);
-
-    if((rdev->sock = socket(PF_INET, SOCK_STREAM, 0)) <= 0)
-    {
-	LOG("%s\n", strerror(errno));
-	exit(1);
-    }
-
-    if(connect(rdev->sock, (struct sockaddr *)&inaddr, 
+    if (connect(dev->sock, (struct sockaddr *)&inaddr,
 		sizeof(inaddr)))
     {
-	LOG("%s\n", strerror(errno));
+	LOG("connerr: %s\n", strerror(errno));
 	exit(1);
     }
 
-    if (fcntl(rdev->sock, F_SETFL, 
-		fcntl(rdev->sock, F_GETFL, 0) | O_NONBLOCK))
+    if (fcntl(dev->sock, F_SETFL,
+		fcntl(dev->sock, F_GETFL, 0) | O_NONBLOCK))
     {
-	LOG("%s\n", strerror(errno));
+	LOG("fcntl: %s\n", strerror(errno));
 	exit(1);
     }
 
-    event_set(&rdev->event, rdev->sock, 
-	    EV_WRITE, (void *)rpcap_handshake, rdev);
-    event_add(&rdev->event, 0);
+    event_set(&dev->event, dev->sock,
+	    EV_WRITE, (void *)rpcap_handshake, dev);
+    event_add(&dev->event, 0);
 }
 
+void rpdev_init(r_dev_t *dev)
+{
+    rpdev_connect(dev);
+    dev->tunfd = tuntap_init(dev->virtual_iface);
+}
+
+void 
+connections_init(r_dev_list_t *rdev_list)
+{
+    r_dev_lnode_t *lnode;
+
+    lnode = rdev_list->head;
+
+    while(lnode)
+    {
+	printf("%p\n", lnode);
+	r_dev_t *dev;
+	dev = lnode->dev; 
+	rpdev_init(dev);
+	lnode = lnode->next;
+    }
+}
+
+void
+daemonize(const char *path)
+{
+    int             status;
+    int             fd;  
+
+    status = fork();
+    if (status < 0) { 
+        fprintf(stderr, "Can't fork!\n");
+        exit(1);
+    }    
+
+    else if (status > 0) 
+        _exit(0);
+
+#if HAVE_SETSID
+    assert(setsid() >= 0);
+#elif defined(TIOCNOTTY)
+    fd = open("/dev/tty", O_RDWR);
+
+    if (fd >= 0)
+        assert(ioctl(fd, TIOCNOTTY, NULL) >= 0);
+#endif
+
+    assert(chdir(path) >= 0);
+
+    fd = open("/dev/null", O_RDWR, 0);
+
+    if (fd != -1) {
+        dup2(fd, STDIN_FILENO);
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        if (fd > 2) 
+            close(fd);
+    }    
+}
+    
 int
 main(int argc, char **argv)
 {
 
-    int nargc;
-    
-    event_init();
+    r_dev_list_t *rdev_list;
+
     globals_init();
-    tunfd = tuntap_init();
+    parse_args(argc, argv);
+    rdev_list = config_parse(config);
+    event_init();
+    connections_init(rdev_list);
 
-    if(!tunfd)
-    {
-	LOG("Unable to open up tuntap %s\n",
-		strerror(errno));
-	exit(1);
-    }
-
-    nargc = parse_args(argc, argv);
-
-    while(nargc++ < argc-1)
-    {
-	printf("%s\n", argv[nargc]);
-	rpcap_srv_init(argv[nargc]);
-    }
+    if (run_daemon)
+	daemonize("/tmp");
 
     event_loop(0);
-
     return 0;
 }
