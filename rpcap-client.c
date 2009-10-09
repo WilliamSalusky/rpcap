@@ -40,6 +40,7 @@ int snaplen;
 int flags;
 char *bpfstr;
 int tunfd;
+int persist;
 
 void globals_init(void)
 {
@@ -47,6 +48,7 @@ void globals_init(void)
     flags   = 0;
     bpfstr  = NULL;
     tunfd   = 0;
+    persist = 1;
 }
 
 void free_rdev(r_dev_t *dev)
@@ -63,12 +65,17 @@ int parse_args(int argc, char **argv)
     int c;
     int argcret = 0;
 
+    char help[] = 
+	"-b <bpf>:          Global BPF Filter\n"
+	"-s <snaplen>       Global Snaplen\n";
+
     while((c=getopt(argc, argv, "hf:s:")) != -1)
     {
 	switch(c)
 	{
 	    case 'h':
-		printf("helo...\n");
+		printf("Usage: %s [opts]\n%s\n", 
+			argv[0], help);
 		exit(1);
 	    case 'f':
 		bpfstr = strdup(optarg);
