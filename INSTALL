@@ -1,0 +1,8 @@
+Make sure libconfuse is installed
+ * sudo apt-get install libconfuse-dev
+ * compile from http://bzero.se/confuse/
+Make sure libevent is installed
+ * sudo apt-get install libevent-dev
+ * compile from http://www.monkey.org/~provos/libevent/
+Type "make"
+
