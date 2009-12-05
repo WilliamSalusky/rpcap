@@ -304,7 +304,6 @@ connections_init(r_dev_list_t *rdev_list)
 
     while(lnode)
     {
-	printf("%p\n", lnode);
 	r_dev_t *dev;
 	dev = lnode->dev; 
 	rpdev_init(dev);

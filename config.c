@@ -67,6 +67,7 @@ r_dev_list_t *config_parse(char *filename)
        CFG_INT("server-port", 1025, CFGF_NONE),
        CFG_STR("interface", "eth0", CFGF_NONE),
        CFG_STR("server", NULL, CFGF_NONE),
+       CFG_BOOL("ignore-rpcap-traffic", 0, CFGF_NONE),
        CFG_END()
    };
 
@@ -87,7 +88,10 @@ r_dev_list_t *config_parse(char *filename)
    {
        cfg_t *rule;
        r_dev_t *dev;
+       char *bpf;
+       int no_rp_traf = 0;
 
+       bpf = NULL;
        dev = rdev_init();
        rule = cfg_getnsec(cfg, "rpcap", i);
 
@@ -98,16 +102,35 @@ r_dev_list_t *config_parse(char *filename)
 	   exit(1);
        }
 
+       if((bpf = cfg_getstr(rule, "bpf")))
+	   dev->iface   = strdup(bpf);
+
        dev->iface   = strdup(cfg_getstr(rule, "interface"));
        dev->port    = cfg_getint(rule, "server-port");
        dev->serv    = strdup(cfg_getstr(rule, "server"));
        dev->snaplen = cfg_getint(rule, "snaplen");
-       dev->bpf     = strdup(cfg_getstr(rule, "bpf"));
        dev->virtual_iface = strdup(cfg_getstr(rule, "output-dev"));
 
-       rdev_list_add(list, dev);
-   }
+       no_rp_traf = cfg_getbool(rule, "ignore-rpcap-traffic");
 
+       rdev_list_add(list, dev);
+
+   
+       if (no_rp_traf)
+       {
+	   char mbuf[2048];
+
+	   memset(mbuf, 0, sizeof(mbuf));
+
+	   snprintf(mbuf, sizeof(mbuf)-1, 
+	       "(!(host %s && port %d)) %s %s", 
+	       dev->serv, dev->port, dev->bpf?"&&":"",
+	       dev->bpf?dev->bpf:"");
+
+	   free(dev->bpf);
+	   dev->bpf = strdup(mbuf);
+       }
+   }
    cfg_free(cfg);
    return list;
 }
