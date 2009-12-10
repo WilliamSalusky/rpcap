@@ -103,7 +103,7 @@ r_dev_list_t *config_parse(char *filename)
        }
 
        if((bpf = cfg_getstr(rule, "bpf")))
-	   dev->iface   = strdup(bpf);
+	   dev->bpf = strdup(bpf);
 
        dev->iface   = strdup(cfg_getstr(rule, "interface"));
        dev->port    = cfg_getint(rule, "server-port");
@@ -130,6 +130,7 @@ r_dev_list_t *config_parse(char *filename)
 	   free(dev->bpf);
 	   dev->bpf = strdup(mbuf);
        }
+       printf("HI THERE %s\n", dev->bpf);
    }
    cfg_free(cfg);
    return list;
